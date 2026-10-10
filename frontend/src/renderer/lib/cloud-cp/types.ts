@@ -1109,3 +1109,59 @@ export interface CloudCpCreateGitHubProjectRequest {
 	displayName?: string;
 	config?: Record<string, unknown>;
 }
+
+/** A billing plan's limits, from the plan's Stripe product metadata. */
+export interface CloudCpPlanLimits {
+	plan: string;
+	maxActiveSandboxes: number;
+	orchestratorSlots: number;
+	windowHours: number;
+	windowSessionHours: number;
+	weeklySessionHours: number;
+	manualResetsPerMonth: number;
+}
+
+/** Usage against the plan, in session-minutes of running sandbox time. */
+export interface CloudCpBillingUsage {
+	windowUsedMinutes: number;
+	windowLimitMinutes: number;
+	windowHours: number;
+	windowResetsAt?: string;
+	weeklyUsedMinutes: number;
+	weeklyLimitMinutes: number;
+	weeklyResetsAt?: string;
+	manualResetsAllowed: number;
+	manualResetsUsed: number;
+	manualResetsRenewAt?: string;
+	activeOrchestrators: number;
+	activeWorkers: number;
+}
+
+/** GET /orgs/{orgId}/billing */
+export interface CloudCpBillingSummary {
+	enabled: boolean;
+	exempt: boolean;
+	plan: string;
+	subscriptionStatus?: string;
+	entitled: boolean;
+	currentPeriodEnd?: string;
+	limits?: CloudCpPlanLimits;
+	usage?: CloudCpBillingUsage;
+	/** Plans available for checkout, cheapest first. */
+	plans?: CloudCpPlanOffer[];
+}
+
+/** A plan the org can choose, priced from Stripe. Price fields are absent when Stripe could not be read. */
+export interface CloudCpPlanOffer {
+	name: string;
+	id: string;
+	unitAmount?: number;
+	currency?: string;
+	interval?: string;
+	limits?: CloudCpPlanLimits;
+}
+
+/** POST /orgs/{orgId}/billing/checkout and /billing/portal */
+export interface CloudCpBillingLinkResponse {
+	url: string;
+}

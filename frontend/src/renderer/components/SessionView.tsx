@@ -97,6 +97,7 @@ import { usesPreviewWorkspaceData } from "../lib/preview-mode";
 import { isOrchestratorSession, sessionAgentExited, sessionIsActive } from "../types/workspace";
 import { terminalTargetBelongsToSession, type TerminalTarget } from "../types/terminal";
 import { matchesRendererShortcut } from "../stores/keybindings-store";
+import { useCloudSessionPresence } from "../hooks/useCloudSessionPresence";
 import { inspectorIsOpen, useResolvedTheme, useUiStore, type InspectorView } from "../stores/ui-store";
 import {
 	INSPECTOR_SEPARATOR_RESERVE_PX,
@@ -407,6 +408,9 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 		: ambiguousRoute ? undefined : listedSession ?? directCloudSession ?? scopedFallback;
 	const interfaceContext = hostId ?? (session ? session.cloud ?? null : cloudOrgId && projectId ? { orgId: cloudOrgId } : undefined);
 	const interfaceUi = useSessionInterfaceSwitch(sessionId, session, interfaceContext);
+	// Reading a cloud session counts as using it, so it is not idle-paused
+	// under someone who is watching the agent work.
+	useCloudSessionPresence(session?.cloud?.orgId, session?.cloud ? session.id : undefined, Boolean(session?.cloud));
 	const { draftBoundaries: chatDraftBoundaries, confirmUnsafeDraftLeave } = interfaceUi;
 	const developerMode = useUiStore((state) => state.developerMode);
 	const remoteHostsEnabled = useUiStore((state) => state.remoteHosts);

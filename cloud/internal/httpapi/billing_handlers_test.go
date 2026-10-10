@@ -130,6 +130,9 @@ func (f *fakeStripe) CreateCheckoutSession(_ context.Context, input billing.Chec
 func (f *fakeStripe) CreatePortalSession(context.Context, string, string) (string, error) {
 	return "https://billing.stripe.test/p_1", nil
 }
+func (f *fakeStripe) GetPrice(_ context.Context, id string) (billing.Price, error) {
+	return billing.Price{ID: id, UnitAmount: 2000, Currency: "usd", Interval: "month"}, nil
+}
 func (f *fakeStripe) GetSubscription(context.Context, string) (billing.Subscription, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -266,7 +269,9 @@ func TestPlanErrorsMapToActionableResponses(t *testing.T) {
 		{postgres.ErrPlanRequired, http.StatusPaymentRequired, "PLAN_REQUIRED"},
 		{postgres.ErrNoResetsLeft, http.StatusConflict, "NO_RESETS_LEFT"},
 		{&postgres.PlanLimitError{Code: postgres.LimitWeekly, Plan: "starter", Limit: 1200, Used: 1200, ResetsAt: &resets},
-			http.StatusForbidden, postgres.LimitWeekly},
+			http.StatusTooManyRequests, postgres.LimitWeekly},
+		{&postgres.PlanLimitError{Code: postgres.LimitWorkerSlots, Plan: "starter", Limit: 1, Used: 1},
+			http.StatusConflict, postgres.LimitWorkerSlots},
 	} {
 		response := httptest.NewRecorder()
 		if !writePlanError(response, httptest.NewRequest(http.MethodPost, "/", nil), tc.err) {
@@ -299,5 +304,17 @@ func TestBillingSummaryReportsDisabledWithoutStripe(t *testing.T) {
 	_ = json.Unmarshal(response.Body.Bytes(), &body)
 	if response.Code != http.StatusOK || body.Enabled || len(body.Plans) != 0 {
 		t.Fatalf("summary without Stripe: %d %+v", response.Code, body)
+	}
+}
+
+func TestBillingSummaryListsPlansPricedFromStripe(t *testing.T) {
+	store, stripe := newFakeBillingStore(), &fakeStripe{}
+	response := httptest.NewRecorder()
+	billingServer(store, stripe).getBilling(response, billingRequest(http.MethodGet, "/", ""))
+	var body billingSummaryResponse
+	_ = json.Unmarshal(response.Body.Bytes(), &body)
+	if response.Code != http.StatusOK || !body.Enabled || len(body.Plans) != 1 ||
+		body.Plans[0].Name != "starter" || body.Plans[0].UnitAmount != 2000 || body.Plans[0].Interval != "month" {
+		t.Fatalf("summary: %d %+v", response.Code, body)
 	}
 }

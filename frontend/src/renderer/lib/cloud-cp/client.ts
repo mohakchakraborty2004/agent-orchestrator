@@ -31,6 +31,8 @@ import type {
 	CloudCpNotificationListQuery,
 	CloudCpNotificationListResponse,
 	CloudCpOrgCoderConfigResponse,
+	CloudCpBillingLinkResponse,
+	CloudCpBillingSummary,
 	CloudCpPutOrgCoderConfigRequest,
 	CloudCpProjectDeletedResponse,
 	CloudCpProjectListResponse,
@@ -222,6 +224,16 @@ export interface CloudCpClient {
 	listCoderTemplates(orgId: string, options?: CloudCpRequestOptions): Promise<CloudCpCoderTemplatesResponse>;
 	/** Reads the org's bring-your-own-Coder connection (non-secret fields only; the API token is never returned). */
 	getOrgCoderConfig(orgId: string, options?: CloudCpRequestOptions): Promise<CloudCpOrgCoderConfigResponse>;
+	/** The org's plan, its limits, and usage against them. */
+	getBilling(orgId: string, options?: CloudCpRequestOptions): Promise<CloudCpBillingSummary>;
+	/** A Stripe Checkout URL that subscribes the org to `plan`. Admins only. */
+	createBillingCheckout(orgId: string, plan: string, options?: CloudCpRequestOptions): Promise<CloudCpBillingLinkResponse>;
+	/** A Stripe Customer Portal URL for changing plan, card, or cancelling. Admins only. */
+	createBillingPortal(orgId: string, options?: CloudCpRequestOptions): Promise<CloudCpBillingLinkResponse>;
+	/** Spend one of the plan's manual resets of the weekly usage limit. Admins only. */
+	resetBillingUsage(orgId: string, options?: CloudCpRequestOptions): Promise<CloudCpBillingSummary>;
+	/** Heartbeat while a session is on screen, so reading it keeps it awake. */
+	touchSessionPresence(orgId: string, sessionId: string, options?: CloudCpRequestOptions): Promise<void>;
 	/** Saves the org's bring-your-own-Coder connection. Omit the token to keep the stored one. */
 	putOrgCoderConfig(
 		orgId: string,
@@ -670,6 +682,15 @@ export function createCloudCpClient(options: CloudCpClientOptions): CloudCpClien
 			requestJson("GET", `/orgs/${seg(orgId)}/sandbox/coder/templates`, { signal: o?.signal }),
 		getOrgCoderConfig: (orgId, o) =>
 			requestJson("GET", `/orgs/${seg(orgId)}/coder-config`, { signal: o?.signal }),
+		getBilling: (orgId, o) => requestJson("GET", `/orgs/${seg(orgId)}/billing`, { signal: o?.signal }),
+		createBillingCheckout: (orgId, plan, o) =>
+			requestJson("POST", `/orgs/${seg(orgId)}/billing/checkout`, { body: { plan }, signal: o?.signal }),
+		createBillingPortal: (orgId, o) =>
+			requestJson("POST", `/orgs/${seg(orgId)}/billing/portal`, { body: {}, signal: o?.signal }),
+		resetBillingUsage: (orgId, o) =>
+			requestJson("POST", `/orgs/${seg(orgId)}/billing/usage/reset`, { body: {}, signal: o?.signal }),
+		touchSessionPresence: (orgId, sessionId, o) =>
+			requestVoid("POST", `/orgs/${seg(orgId)}/sessions/${seg(sessionId)}/presence`, { signal: o?.signal }),
 		putOrgCoderConfig: (orgId, body, o) =>
 			requestJson("PUT", `/orgs/${seg(orgId)}/coder-config`, { body, signal: o?.signal }),
 		deleteOrgCoderConfig: (orgId, o) =>

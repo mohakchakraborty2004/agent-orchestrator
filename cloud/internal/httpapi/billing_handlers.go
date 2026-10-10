@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -21,6 +23,7 @@ type StripeAPI interface {
 	CreateCheckoutSession(ctx context.Context, input billing.CheckoutRequest) (string, error)
 	CreatePortalSession(ctx context.Context, customerID, returnURL string) (string, error)
 	GetSubscription(ctx context.Context, subscriptionID string) (billing.Subscription, error)
+	GetPrice(ctx context.Context, priceID string) (billing.Price, error)
 }
 
 // BillingOptions configures Stripe billing. A nil *BillingOptions leaves
@@ -54,9 +57,57 @@ func (s *Server) billingReady() bool {
 	return s.billingOptions != nil && s.billingStore != nil && s.billingOptions.Stripe != nil
 }
 
+// planOffer is one plan the organization can choose, priced from Stripe.
+type planOffer struct {
+	Name string `json:"name"`
+	billing.Price
+}
+
 type billingSummaryResponse struct {
 	domain.BillingSummary
-	Plans []string `json:"plans"`
+	Plans []planOffer `json:"plans"`
+}
+
+// planOfferTTL bounds how stale a cached price may be: a price edited in the
+// Stripe dashboard shows in the app within this long.
+const planOfferTTL = 10 * time.Minute
+
+type planOfferCache struct {
+	mu      sync.Mutex
+	offers  []planOffer
+	fetched time.Time
+}
+
+// planOffers returns the configured plans priced from Stripe, cached. A plan
+// whose price cannot be read is listed by name only rather than hidden.
+func (s *Server) planOffers(ctx context.Context) []planOffer {
+	cache := &s.offerCache
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.offers != nil && time.Since(cache.fetched) < planOfferTTL {
+		return cache.offers
+	}
+	names := make([]string, 0, len(s.billingOptions.PriceIDs))
+	for name := range s.billingOptions.PriceIDs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	offers := make([]planOffer, 0, len(names))
+	complete := true
+	for _, name := range names {
+		priceID := s.billingOptions.PriceIDs[name]
+		price, err := s.billingOptions.Stripe.GetPrice(ctx, priceID)
+		if err != nil {
+			s.logger.Warn("read Stripe price", "plan", name, "price_id", priceID, "error", err)
+			price, complete = billing.Price{ID: priceID}, false
+		}
+		offers = append(offers, planOffer{Name: name, Price: price})
+	}
+	sort.SliceStable(offers, func(i, j int) bool { return offers[i].UnitAmount < offers[j].UnitAmount })
+	if complete {
+		cache.offers, cache.fetched = offers, time.Now()
+	}
+	return offers
 }
 
 func (s *Server) getBilling(w http.ResponseWriter, r *http.Request) {
@@ -66,7 +117,7 @@ func (s *Server) getBilling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.billingStore == nil {
-		writeJSON(w, http.StatusOK, billingSummaryResponse{Plans: []string{}})
+		writeJSON(w, http.StatusOK, billingSummaryResponse{Plans: []planOffer{}})
 		return
 	}
 	summary, err := s.billingStore.BillingSummary(r.Context(), principalFrom(r), orgID)
@@ -74,12 +125,9 @@ func (s *Server) getBilling(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, r, err)
 		return
 	}
-	plans := []string{}
+	plans := []planOffer{}
 	if s.billingReady() {
-		for plan := range s.billingOptions.PriceIDs {
-			plans = append(plans, plan)
-		}
-		sort.Strings(plans)
+		plans = s.planOffers(r.Context())
 	} else {
 		summary.Enabled = false
 	}
@@ -356,8 +404,20 @@ func writePlanError(w http.ResponseWriter, r *http.Request, err error) bool {
 		writeError(w, r, http.StatusConflict, "NO_RESETS_LEFT", "There are no manual resets left this billing period.")
 		return true
 	case errors.As(err, &limitErr):
-		writeJSON(w, http.StatusForbidden, planLimitEnvelope{
-			Error:     http.StatusText(http.StatusForbidden),
+		// Not 403: the desktop client reads a 403 as a stale organization
+		// membership and re-resolves the org. A full slot is a conflict with
+		// existing sessions; a usage limit is a rate limit that lifts on its own.
+		status := http.StatusConflict
+		if limitErr.Code == postgres.LimitWindow || limitErr.Code == postgres.LimitWeekly {
+			status = http.StatusTooManyRequests
+			if limitErr.ResetsAt != nil {
+				if wait := time.Until(*limitErr.ResetsAt); wait > 0 {
+					w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+				}
+			}
+		}
+		writeJSON(w, status, planLimitEnvelope{
+			Error:     http.StatusText(status),
 			Code:      limitErr.Code,
 			Message:   planLimitMessage(limitErr.Code),
 			RequestID: requestID(r),

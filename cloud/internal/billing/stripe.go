@@ -252,6 +252,39 @@ func (c *Client) GetSubscription(ctx context.Context, subscriptionID string) (Su
 	return subscription, nil
 }
 
+// Price is a plan's price as shown to a customer choosing a plan.
+type Price struct {
+	ID         string             `json:"id"`
+	UnitAmount int64              `json:"unitAmount"`
+	Currency   string             `json:"currency"`
+	Interval   string             `json:"interval"`
+	Limits     *domain.PlanLimits `json:"limits,omitempty"`
+}
+
+// GetPrice fetches a price with its product, for the plan picker.
+func (c *Client) GetPrice(ctx context.Context, priceID string) (Price, error) {
+	var raw struct {
+		ID         string `json:"id"`
+		UnitAmount int64  `json:"unit_amount"`
+		Currency   string `json:"currency"`
+		Recurring  struct {
+			Interval string `json:"interval"`
+		} `json:"recurring"`
+		Product struct {
+			Metadata map[string]string `json:"metadata"`
+		} `json:"product"`
+	}
+	path := "/v1/prices/" + url.PathEscape(priceID) + "?expand[]=product"
+	if err := c.do(ctx, http.MethodGet, path, nil, "", &raw); err != nil {
+		return Price{}, err
+	}
+	price := Price{ID: raw.ID, UnitAmount: raw.UnitAmount, Currency: raw.Currency, Interval: raw.Recurring.Interval}
+	if limits, err := domain.ParsePlanLimits(raw.Product.Metadata); err == nil {
+		price.Limits = &limits
+	}
+	return price, nil
+}
+
 // Event is a verified webhook event. Only the fields billing reads are
 // decoded; the object is re-fetched from Stripe before anything is written.
 type Event struct {
