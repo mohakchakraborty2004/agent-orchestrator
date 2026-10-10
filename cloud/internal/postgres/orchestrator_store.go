@@ -141,7 +141,7 @@ func (s *Store) CreateOrchestratorChild(
 			creator = *createdByUserID
 		}
 		child, err = createSessionTx(
-			ctx, tx, orgID, idempotencyKey, maxActiveSandboxes,
+			ctx, tx, orgID, idempotencyKey, maxActiveSandboxes, s.billing,
 			input, orchestratorSessionID, creator,
 		)
 		return err

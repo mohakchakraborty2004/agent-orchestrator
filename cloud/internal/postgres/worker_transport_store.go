@@ -566,6 +566,7 @@ func (s *Store) IssueTerminalTicket(
 						THEN now() + $4::interval
 					ELSE interactive_until
 				END,
+				last_interaction_at = CASE WHEN $3 THEN last_interaction_at ELSE now() END,
 				updated_at = now()
 			WHERE org_id = $1 AND session_id = $2`,
 			orgID, sessionID, leaseThrottled, intervalString(interactiveSessionLease),
@@ -753,6 +754,7 @@ func (s *Store) RefreshTerminalInteraction(
 		tag, err := tx.Exec(ctx,
 			`UPDATE ao_sandboxes
 			SET interactive_until = now() + $1::interval,
+				last_interaction_at = now(),
 				reconcile_after = now(), updated_at = now()
 			WHERE org_id = $2 AND session_id = $3
 			  AND desired_state = 'running'

@@ -69,6 +69,14 @@ func (s *Server) createTerminalTicket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusUnprocessableEntity, "validation_error", "The terminal ID must be a UUID.")
 		return
 	}
+	// A ticket wakes a paused sandbox, so it is subject to the plan's usage
+	// limits like resume is.
+	if s.billingStore != nil {
+		if err := s.billingStore.WakeAllowed(r.Context(), principalFrom(r), orgID, sessionID); err != nil {
+			s.writeStoreError(w, r, err)
+			return
+		}
+	}
 	token, scopes, err := s.store.IssueTerminalTicket(
 		r.Context(), principalFrom(r), orgID, sessionID, input.Kind, input.TerminalID, terminalTicketTTL,
 	)

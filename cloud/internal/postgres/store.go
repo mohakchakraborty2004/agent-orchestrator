@@ -29,7 +29,8 @@ var (
 )
 
 type Store struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	billing billingPolicy
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {

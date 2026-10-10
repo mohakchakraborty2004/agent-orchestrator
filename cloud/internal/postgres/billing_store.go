@@ -1,0 +1,534 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/aoagents/agent-orchestrator/cloud/internal/domain"
+)
+
+// ErrPlanRequired rejects paid work for an organization without an entitled
+// subscription.
+var ErrPlanRequired = errors.New("an active plan is required")
+
+// ErrNoResetsLeft rejects a manual usage reset once the plan's allowance for
+// the billing period is spent.
+var ErrNoResetsLeft = errors.New("no manual usage resets left this billing period")
+
+// Plan limit codes carried by PlanLimitError.
+const (
+	LimitOrchestratorSlots = "ORCHESTRATOR_SLOTS_FULL"
+	LimitWorkerSlots       = "WORKER_SLOTS_FULL"
+	LimitWindow            = "WINDOW_LIMIT_REACHED"
+	LimitWeekly            = "WEEKLY_LIMIT_REACHED"
+)
+
+// PlanLimitError rejects work that would exceed one of the plan's limits.
+type PlanLimitError struct {
+	Code     string
+	Plan     string
+	Limit    int
+	Used     int
+	ResetsAt *time.Time
+}
+
+func (e *PlanLimitError) Error() string {
+	return fmt.Sprintf("plan limit %s: %d of %d", e.Code, e.Used, e.Limit)
+}
+
+// billingPolicy is how session creation treats billing. The zero value turns
+// enforcement off, which is what local and self-hosted control planes get.
+type billingPolicy struct {
+	enforced     bool
+	pastDueGrace time.Duration
+}
+
+// EnableBilling turns plan enforcement on for session creation.
+func (s *Store) EnableBilling(pastDueGrace time.Duration) {
+	s.billing = billingPolicy{enforced: true, pastDueGrace: pastDueGrace}
+}
+
+// BillingEnforced reports whether plan enforcement is on.
+func (s *Store) BillingEnforced() bool { return s.billing.enforced }
+
+func orgBillingTx(ctx context.Context, tx pgx.Tx, orgID string) (domain.OrgBilling, error) {
+	billing := domain.OrgBilling{OrgID: orgID}
+	var customer, subscription, status *string
+	var limits []byte
+	err := tx.QueryRow(ctx,
+		`SELECT plan, stripe_customer_id, stripe_subscription_id, subscription_status, plan_limits,
+			billing_period_start, billing_period_end, usage_week_anchor, past_due_since
+		FROM ao_organizations WHERE id = $1`,
+		orgID,
+	).Scan(&billing.Plan, &customer, &subscription, &status, &limits,
+		&billing.PeriodStart, &billing.PeriodEnd, &billing.UsageWeekAnchor, &billing.PastDueSince)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OrgBilling{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.OrgBilling{}, err
+	}
+	if customer != nil {
+		billing.StripeCustomerID = *customer
+	}
+	if subscription != nil {
+		billing.StripeSubscriptionID = *subscription
+	}
+	if status != nil {
+		billing.SubscriptionStatus = *status
+	}
+	if len(limits) > 0 {
+		var parsed domain.PlanLimits
+		if err := json.Unmarshal(limits, &parsed); err != nil {
+			return domain.OrgBilling{}, fmt.Errorf("decode plan limits: %w", err)
+		}
+		billing.Limits = &parsed
+	}
+	return billing, nil
+}
+
+// OrgBilling returns an organization's billing state to a member.
+func (s *Store) OrgBilling(ctx context.Context, principal domain.Principal, orgID string) (domain.OrgBilling, error) {
+	var billing domain.OrgBilling
+	err := s.withTenant(ctx, principal, orgID, func(tx pgx.Tx) error {
+		var err error
+		billing, err = orgBillingTx(ctx, tx, orgID)
+		return err
+	})
+	return billing, err
+}
+
+// RequireOrgAdmin returns ErrForbidden unless the principal administers the
+// organization.
+func (s *Store) RequireOrgAdmin(ctx context.Context, principal domain.Principal, orgID string) error {
+	return s.withTenant(ctx, principal, orgID, func(tx pgx.Tx) error {
+		return requireOrgAdmin(ctx, tx, orgID, principal.UserID)
+	})
+}
+
+// OrgDisplayName returns an organization's name for its Stripe customer.
+func (s *Store) OrgDisplayName(ctx context.Context, orgID string) (string, error) {
+	var name string
+	err := s.withOrg(ctx, orgID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT display_name FROM ao_organizations WHERE id = $1`, orgID).Scan(&name)
+	})
+	return name, err
+}
+
+// LinkStripeCustomer records the organization's Stripe customer. Linking the
+// same pair again is a no-op; a different customer for an organization that
+// already has one is refused, so a webhook can never move an organization.
+func (s *Store) LinkStripeCustomer(ctx context.Context, orgID, customerID string) error {
+	return s.withOrg(ctx, orgID, func(tx pgx.Tx) error {
+		var existing *string
+		if err := tx.QueryRow(ctx,
+			`SELECT stripe_customer_id FROM ao_organizations WHERE id = $1 FOR UPDATE`, orgID,
+		).Scan(&existing); err != nil {
+			return err
+		}
+		if existing != nil && *existing != customerID {
+			return fmt.Errorf("organization %s already has Stripe customer %s: %w", orgID, *existing, ErrConflict)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO ao_stripe_customers (stripe_customer_id, org_id) VALUES ($1, $2)
+			ON CONFLICT (stripe_customer_id) DO NOTHING`, customerID, orgID,
+		); err != nil {
+			return normalizeConstraintError(err)
+		}
+		_, err := tx.Exec(ctx, `UPDATE ao_organizations SET stripe_customer_id = $2, updated_at = now() WHERE id = $1`,
+			orgID, customerID)
+		return err
+	})
+}
+
+// OrgForStripeCustomer finds the organization a Stripe customer belongs to.
+func (s *Store) OrgForStripeCustomer(ctx context.Context, customerID string) (string, bool, error) {
+	var orgID string
+	err := s.withService(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT org_id FROM ao_stripe_customers WHERE stripe_customer_id = $1`, customerID,
+		).Scan(&orgID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	return orgID, err == nil, err
+}
+
+// SubscriptionUpdate is a subscription's current state as read from Stripe.
+type SubscriptionUpdate struct {
+	SubscriptionID string
+	Status         string
+	Limits         *domain.PlanLimits
+	PeriodStart    *time.Time
+	PeriodEnd      *time.Time
+}
+
+// ApplySubscription stores the subscription's current state on the
+// organization. It is idempotent, so replayed or reordered webhooks that each
+// re-read Stripe converge on the same row. An internal (exempt) plan is never
+// overwritten.
+func (s *Store) ApplySubscription(ctx context.Context, orgID string, update SubscriptionUpdate) error {
+	var limits []byte
+	plan := "free"
+	if update.Limits != nil {
+		encoded, err := json.Marshal(update.Limits)
+		if err != nil {
+			return err
+		}
+		limits = encoded
+		plan = update.Limits.Plan
+	}
+	entitled := update.Status == "active" || update.Status == "trialing" || update.Status == "past_due"
+	if !entitled {
+		plan = "free"
+	}
+	return s.withOrg(ctx, orgID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE ao_organizations SET
+				stripe_subscription_id = $2,
+				subscription_status = $3,
+				plan_limits = coalesce($4::jsonb, plan_limits),
+				plan = CASE WHEN plan = $5 THEN plan ELSE $6 END,
+				billing_period_start = $7,
+				billing_period_end = $8,
+				usage_week_anchor = CASE WHEN $9 THEN coalesce(usage_week_anchor, now()) ELSE usage_week_anchor END,
+				past_due_since = CASE
+					WHEN $3 = 'past_due' THEN coalesce(past_due_since, now())
+					ELSE NULL
+				END,
+				updated_at = now()
+			WHERE id = $1`,
+			orgID, update.SubscriptionID, update.Status, limits, domain.PlanInternal, plan,
+			update.PeriodStart, update.PeriodEnd, entitled,
+		)
+		return err
+	})
+}
+
+// StripeEventSeen reports whether a webhook event was already processed.
+func (s *Store) StripeEventSeen(ctx context.Context, eventID string) (bool, error) {
+	var seen bool
+	err := s.withService(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ao_stripe_events WHERE event_id = $1)`, eventID).Scan(&seen)
+	})
+	return seen, err
+}
+
+// RecordStripeEvent marks a webhook event processed.
+func (s *Store) RecordStripeEvent(ctx context.Context, eventID, eventType string) error {
+	return s.withService(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO ao_stripe_events (event_id, type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`,
+			eventID, eventType)
+		return err
+	})
+}
+
+// usageTx measures an organization's usage against its plan at now.
+func usageTx(ctx context.Context, tx pgx.Tx, billing domain.OrgBilling, now time.Time) (domain.UsageSummary, error) {
+	var usage domain.UsageSummary
+	if err := tx.QueryRow(ctx,
+		`SELECT
+			count(*) FILTER (WHERE se.kind = 'orchestrator'),
+			count(*) FILTER (WHERE se.kind <> 'orchestrator')
+		FROM ao_sandboxes sb
+		JOIN ao_sessions se ON se.org_id = sb.org_id AND se.id = sb.session_id
+		WHERE sb.org_id = $1
+			AND sb.observed_state NOT IN ('deleted', 'deleting', 'terminated', 'failed')`,
+		billing.OrgID,
+	).Scan(&usage.ActiveOrchestrators, &usage.ActiveWorkers); err != nil {
+		return usage, err
+	}
+	limits := billing.Limits
+	if limits == nil {
+		return usage, nil
+	}
+	usage.WindowHours = limits.WindowHours
+	usage.WindowLimitMinutes = limits.WindowMinutes()
+	usage.WeeklyLimitMinutes = limits.WeeklyMinutes()
+	usage.ManualResetsAllowed = limits.ManualResetsPerMonth
+
+	window := time.Duration(limits.WindowHours) * time.Hour
+	windowStart := now.Add(-window)
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM ao_usage_minutes WHERE org_id = $1 AND minute > $2`,
+		billing.OrgID, windowStart,
+	).Scan(&usage.WindowUsedMinutes); err != nil {
+		return usage, err
+	}
+	if usage.WindowUsedMinutes >= usage.WindowLimitMinutes && usage.WindowLimitMinutes > 0 {
+		// The rolling window falls back under the limit once enough of its
+		// oldest minutes age out.
+		var minute time.Time
+		err := tx.QueryRow(ctx,
+			`SELECT minute FROM ao_usage_minutes WHERE org_id = $1 AND minute > $2
+			ORDER BY minute OFFSET $3 LIMIT 1`,
+			billing.OrgID, windowStart, usage.WindowUsedMinutes-usage.WindowLimitMinutes,
+		).Scan(&minute)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return usage, err
+		}
+		if err == nil {
+			resets := minute.Add(window + time.Minute)
+			usage.WindowResetsAt = &resets
+		}
+	}
+
+	resetPeriod := domain.ResetPeriodStart(billing.PeriodStart, now)
+	var lastReset *time.Time
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FILTER (WHERE reset_at >= $2), max(reset_at)
+		FROM ao_usage_resets WHERE org_id = $1`,
+		billing.OrgID, resetPeriod,
+	).Scan(&usage.ManualResetsUsed, &lastReset); err != nil {
+		return usage, err
+	}
+	if billing.PeriodEnd != nil && billing.PeriodEnd.After(now) {
+		renew := *billing.PeriodEnd
+		usage.ManualResetsRenewAt = &renew
+	} else {
+		renew := resetPeriod.AddDate(0, 1, 0)
+		usage.ManualResetsRenewAt = &renew
+	}
+
+	anchor := now
+	if billing.UsageWeekAnchor != nil {
+		anchor = *billing.UsageWeekAnchor
+	}
+	weekStart, weekResets := domain.UsageWeekBounds(anchor, lastReset, now)
+	usage.WeeklyResetsAt = &weekResets
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM ao_usage_minutes WHERE org_id = $1 AND minute >= $2`,
+		billing.OrgID, weekStart,
+	).Scan(&usage.WeeklyUsedMinutes); err != nil {
+		return usage, err
+	}
+	return usage, nil
+}
+
+// planAdmissionTx decides whether the organization may start (or wake) a
+// session of kind. countSlots is false for a wake: the session already holds
+// its slot. Only entitlement and usage are checked then.
+func (p billingPolicy) planAdmissionTx(
+	ctx context.Context, tx pgx.Tx, orgID, kind string, countSlots bool, now time.Time,
+) error {
+	if !p.enforced {
+		return nil
+	}
+	billing, err := orgBillingTx(ctx, tx, orgID)
+	if err != nil {
+		return err
+	}
+	if billing.Exempt() {
+		return nil
+	}
+	if billing.Limits == nil ||
+		!domain.SubscriptionEntitled(billing.SubscriptionStatus, billing.PastDueSince, p.pastDueGrace, now) {
+		return ErrPlanRequired
+	}
+	limits := *billing.Limits
+	usage, err := usageTx(ctx, tx, billing, now)
+	if err != nil {
+		return err
+	}
+	if countSlots {
+		if kind == "orchestrator" && limits.OrchestratorSlots > 0 {
+			if usage.ActiveOrchestrators >= limits.OrchestratorSlots {
+				return &PlanLimitError{Code: LimitOrchestratorSlots, Plan: limits.Plan,
+					Limit: limits.OrchestratorSlots, Used: usage.ActiveOrchestrators}
+			}
+		} else {
+			// Without reserved orchestrator slots an orchestrator is counted
+			// like any other session.
+			used, limit := usage.ActiveWorkers, limits.WorkerSlots()
+			if kind == "orchestrator" {
+				used, limit = usage.ActiveWorkers+usage.ActiveOrchestrators, limits.MaxActiveSandboxes
+			}
+			if used >= limit {
+				return &PlanLimitError{Code: LimitWorkerSlots, Plan: limits.Plan, Limit: limit, Used: used}
+			}
+		}
+	}
+	if usage.WindowUsedMinutes >= usage.WindowLimitMinutes {
+		return &PlanLimitError{Code: LimitWindow, Plan: limits.Plan, Limit: usage.WindowLimitMinutes,
+			Used: usage.WindowUsedMinutes, ResetsAt: usage.WindowResetsAt}
+	}
+	if usage.WeeklyUsedMinutes >= usage.WeeklyLimitMinutes {
+		return &PlanLimitError{Code: LimitWeekly, Plan: limits.Plan, Limit: usage.WeeklyLimitMinutes,
+			Used: usage.WeeklyUsedMinutes, ResetsAt: usage.WeeklyResetsAt}
+	}
+	return nil
+}
+
+// BillingSummary returns what the desktop app shows on its billing screen.
+func (s *Store) BillingSummary(ctx context.Context, principal domain.Principal, orgID string) (domain.BillingSummary, error) {
+	summary := domain.BillingSummary{Enabled: s.billing.enforced}
+	err := s.withTenant(ctx, principal, orgID, func(tx pgx.Tx) error {
+		billing, err := orgBillingTx(ctx, tx, orgID)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		summary.Plan = billing.Plan
+		summary.Exempt = billing.Exempt()
+		summary.SubscriptionStatus = billing.SubscriptionStatus
+		summary.CurrentPeriodEnd = billing.PeriodEnd
+		summary.Limits = billing.Limits
+		summary.Entitled = summary.Exempt || (billing.Limits != nil &&
+			domain.SubscriptionEntitled(billing.SubscriptionStatus, billing.PastDueSince, s.billing.pastDueGrace, now))
+		usage, err := usageTx(ctx, tx, billing, now)
+		if err != nil {
+			return err
+		}
+		summary.Usage = &usage
+		return nil
+	})
+	return summary, err
+}
+
+// ResetWeeklyUsage spends one of the plan's manual resets: the weekly usage
+// window starts afresh now. Only organization admins may reset.
+func (s *Store) ResetWeeklyUsage(ctx context.Context, principal domain.Principal, orgID string) error {
+	return s.withTenant(ctx, principal, orgID, func(tx pgx.Tx) error {
+		if err := requireOrgAdmin(ctx, tx, orgID, principal.UserID); err != nil {
+			return err
+		}
+		// Serialize with session creation and concurrent resets.
+		if _, err := tx.Exec(ctx, `SELECT id FROM ao_organizations WHERE id = $1 FOR UPDATE`, orgID); err != nil {
+			return err
+		}
+		billing, err := orgBillingTx(ctx, tx, orgID)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		if billing.Exempt() {
+			return nil
+		}
+		if billing.Limits == nil ||
+			!domain.SubscriptionEntitled(billing.SubscriptionStatus, billing.PastDueSince, s.billing.pastDueGrace, now) {
+			return ErrPlanRequired
+		}
+		var used int
+		if err := tx.QueryRow(ctx,
+			`SELECT count(*) FROM ao_usage_resets WHERE org_id = $1 AND reset_at >= $2`,
+			orgID, domain.ResetPeriodStart(billing.PeriodStart, now),
+		).Scan(&used); err != nil {
+			return err
+		}
+		if used >= billing.Limits.ManualResetsPerMonth {
+			return ErrNoResetsLeft
+		}
+		_, err = tx.Exec(ctx,
+			`INSERT INTO ao_usage_resets (org_id, reset_at, actor_user_id) VALUES ($1, $2, $3)`,
+			orgID, now, principal.UserID)
+		return err
+	})
+}
+
+// WakeAllowed reports whether a paused session may be woken under the plan.
+// A running session is always allowed; it already holds its slot and its
+// usage is enforced by the usage enforcer.
+func (s *Store) WakeAllowed(ctx context.Context, principal domain.Principal, orgID, sessionID string) error {
+	if !s.billing.enforced {
+		return nil
+	}
+	return s.withTenant(ctx, principal, orgID, func(tx pgx.Tx) error {
+		var desired string
+		err := tx.QueryRow(ctx,
+			`SELECT desired_state FROM ao_sandboxes WHERE org_id = $1 AND session_id = $2`, orgID, sessionID,
+		).Scan(&desired)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && desired == "running") {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return s.billing.planAdmissionTx(ctx, tx, orgID, "", false, time.Now())
+	})
+}
+
+// SampleUsage records the current minute for every running sandbox and
+// returns the organizations that have one, for the usage enforcer.
+func (s *Store) SampleUsage(ctx context.Context) ([]string, error) {
+	var orgIDs []string
+	err := s.withService(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO ao_usage_minutes (org_id, minute, session_id)
+			SELECT org_id, date_trunc('minute', now()), session_id FROM ao_sandboxes
+			WHERE desired_state = 'running' AND observed_state = 'running'
+			ON CONFLICT DO NOTHING`,
+		); err != nil {
+			return fmt.Errorf("sample usage: %w", err)
+		}
+		rows, err := tx.Query(ctx,
+			`SELECT DISTINCT org_id::text FROM ao_sandboxes
+			WHERE desired_state = 'running' AND observed_state = 'running'`)
+		if err != nil {
+			return err
+		}
+		orgIDs, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		return err
+	})
+	return orgIDs, err
+}
+
+// PruneUsage drops usage older than any window still measured.
+func (s *Store) PruneUsage(ctx context.Context, before time.Time) error {
+	return s.withService(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `DELETE FROM ao_usage_minutes WHERE minute < $1`, before)
+		return err
+	})
+}
+
+// PauseOverLimit pauses an organization's running sessions when it is over
+// its plan (no entitled subscription, or a usage limit reached). A session is
+// paused only between turns: work in flight is allowed to finish and is
+// paused on a later pass. Returns how many sessions were paused.
+func (s *Store) PauseOverLimit(ctx context.Context, orgID string) (int64, error) {
+	if !s.billing.enforced {
+		return 0, nil
+	}
+	var paused int64
+	err := s.withOrg(ctx, orgID, func(tx pgx.Tx) error {
+		err := s.billing.planAdmissionTx(ctx, tx, orgID, "", false, time.Now())
+		var limitErr *PlanLimitError
+		if err == nil || !(errors.Is(err, ErrPlanRequired) || errors.As(err, &limitErr)) {
+			return err
+		}
+		tag, err := tx.Exec(ctx,
+			`UPDATE ao_sandboxes SET desired_state = 'paused', startup_started_at = NULL,
+				reconcile_after = now(), updated_at = now()
+			WHERE org_id = $1
+				AND desired_state = 'running'
+				AND observed_state = 'running'
+				AND NOT EXISTS (
+					SELECT 1 FROM ao_sessions se
+					WHERE se.org_id = ao_sandboxes.org_id AND se.id = ao_sandboxes.session_id
+						AND se.activity_state = 'active'
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM ao_turns t
+					WHERE t.org_id = ao_sandboxes.org_id AND t.session_id = ao_sandboxes.session_id
+						AND t.state IN ('queued', 'provisioning', 'running', 'cancel_requested')
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM ao_review_runs r
+					WHERE r.org_id = ao_sandboxes.org_id AND r.review_session_id = ao_sandboxes.session_id
+						AND r.status = 'running'
+				)`,
+			orgID)
+		if err != nil {
+			return err
+		}
+		paused = tag.RowsAffected()
+		return nil
+	})
+	return paused, err
+}

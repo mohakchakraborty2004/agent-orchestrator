@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/cloud/internal/auth"
+	"github.com/aoagents/agent-orchestrator/cloud/internal/billing"
 	"github.com/aoagents/agent-orchestrator/cloud/internal/cifeedback"
 	"github.com/aoagents/agent-orchestrator/cloud/internal/config"
 	"github.com/aoagents/agent-orchestrator/cloud/internal/githubapp"
@@ -514,6 +515,17 @@ func run(logger *slog.Logger) error {
 		})
 		apiOptions.ProjectSnapshots = projectSnapshots
 		go projectSnapshots.RunCollector(ctx)
+	}
+	if cfg.BillingEnabled() {
+		store.EnableBilling(cfg.BillingPastDueGrace)
+		apiOptions.Billing = &httpapi.BillingOptions{
+			Stripe:        billing.NewClient(cfg.StripeSecretKey, cfg.StripeBaseURL),
+			WebhookSecret: cfg.StripeWebhookSecret,
+			PriceIDs:      cfg.StripePriceIDs,
+			ReturnURL:     cfg.BillingReturn(),
+		}
+		go (&billing.Enforcer{Store: store, Logger: logger}).Run(ctx)
+		logger.Info("Stripe billing enabled", "plans", len(cfg.StripePriceIDs))
 	}
 	api := httpapi.New(apiOptions)
 	go notificationProcessor.Run(ctx)

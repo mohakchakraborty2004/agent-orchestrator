@@ -123,6 +123,22 @@ type Config struct {
 	FreestyleWorkerTokenTTL    time.Duration
 	FreestyleAutoPauseSeconds  int
 
+	// Stripe billing (AO_CLOUD_STRIPE_*). Billing is enforced only when
+	// StripeSecretKey is set, so local and self-hosted control planes keep
+	// working without Stripe.
+	StripeSecretKey     string
+	StripeWebhookSecret string
+	StripeBaseURL       string
+	// StripePriceIDs maps a plan name to its Stripe price
+	// (AO_CLOUD_STRIPE_PRICE_IDS, JSON object such as {"starter":"price_..."}).
+	StripePriceIDs map[string]string
+	// BillingReturnURL is where Checkout and the Customer Portal send the
+	// browser back to. Defaults to the control plane's /billing/return page.
+	BillingReturnURL string
+	// BillingPastDueGrace is how long a past_due subscription keeps working
+	// while Stripe retries the card.
+	BillingPastDueGrace time.Duration
+
 	DockerHost           string
 	DockerWorkerImage    string
 	DockerNetwork        string
@@ -169,7 +185,11 @@ const defaultNodeOpsAutoPauseSeconds = 0
 // Give background sessions a full hour before their NodeOps VM is paused. A
 // visible workspace terminal still holds its shorter interactive lease, but
 // this default avoids turning an ordinary review break into a cold resume.
-const defaultIdlePauseThreshold = time.Hour
+// defaultIdlePauseThreshold pauses a session after 15 quiet minutes. On a
+// provider that snapshots memory (Freestyle) a pause keeps the agent and wakes
+// in about a second, so a short threshold costs the user little and keeps
+// idle sessions from holding compute.
+const defaultIdlePauseThreshold = 15 * time.Minute
 
 const defaultIdlePauseInterval = 30 * time.Second
 
@@ -191,6 +211,12 @@ func Load() (Config, error) {
 	if raw := strings.TrimSpace(os.Getenv("AO_CLOUD_FREESTYLE_SNAPSHOT_BY_HARNESS")); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &freestyleSnapshotByHarnessEnv); err != nil {
 			return Config{}, fmt.Errorf("invalid AO_CLOUD_FREESTYLE_SNAPSHOT_BY_HARNESS: %w", err)
+		}
+	}
+	stripePriceIDsEnv := map[string]string{}
+	if raw := strings.TrimSpace(os.Getenv("AO_CLOUD_STRIPE_PRICE_IDS")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &stripePriceIDsEnv); err != nil {
+			return Config{}, fmt.Errorf("invalid AO_CLOUD_STRIPE_PRICE_IDS: %w", err)
 		}
 	}
 	coderParametersEnv := map[string]string{}
@@ -273,6 +299,12 @@ func Load() (Config, error) {
 			"AO_CLOUD_FREESTYLE_WORKER_TOKEN_TTL", sandbox.DefaultWorkerTokenTTL,
 		),
 		FreestyleAutoPauseSeconds: intEnvOrDefault("AO_CLOUD_FREESTYLE_AUTO_PAUSE_SECONDS", 0),
+		StripeSecretKey:           strings.TrimSpace(os.Getenv("AO_CLOUD_STRIPE_SECRET_KEY")),
+		StripeWebhookSecret:       strings.TrimSpace(os.Getenv("AO_CLOUD_STRIPE_WEBHOOK_SECRET")),
+		StripeBaseURL:             strings.TrimSpace(os.Getenv("AO_CLOUD_STRIPE_BASE_URL")),
+		StripePriceIDs:            stripePriceIDsEnv,
+		BillingReturnURL:          strings.TrimSpace(os.Getenv("AO_CLOUD_BILLING_RETURN_URL")),
+		BillingPastDueGrace:       durationEnv("AO_CLOUD_BILLING_PAST_DUE_GRACE", 7*24*time.Hour),
 
 		DockerHost:        envOrDefault("AO_CLOUD_DOCKER_HOST", "unix:///var/run/docker.sock"),
 		DockerWorkerImage: envOrDefault("AO_CLOUD_DOCKER_WORKER_IMAGE", "ao-cloud-worker:local"),
@@ -542,6 +574,25 @@ func Load() (Config, error) {
 	if cfg.IdlePauseThreshold != 0 && cfg.IdlePauseThreshold < time.Minute {
 		return Config{}, errors.New("AO_CLOUD_IDLE_PAUSE_THRESHOLD must be 0 (disabled) or at least 1m")
 	}
+	if cfg.BillingEnabled() {
+		if cfg.StripeWebhookSecret == "" {
+			return Config{}, errors.New("AO_CLOUD_STRIPE_WEBHOOK_SECRET is required when AO_CLOUD_STRIPE_SECRET_KEY is set")
+		}
+		if len(cfg.StripePriceIDs) == 0 {
+			return Config{}, errors.New("AO_CLOUD_STRIPE_PRICE_IDS is required when AO_CLOUD_STRIPE_SECRET_KEY is set")
+		}
+		for plan, price := range cfg.StripePriceIDs {
+			if strings.TrimSpace(plan) == "" || !strings.HasPrefix(strings.TrimSpace(price), "price_") {
+				return Config{}, fmt.Errorf("AO_CLOUD_STRIPE_PRICE_IDS: plan %q must map to a price_ id", plan)
+			}
+		}
+		if cfg.BillingReturnURL == "" && cfg.PublicURL == "" {
+			return Config{}, errors.New("AO_CLOUD_BILLING_RETURN_URL or AO_CLOUD_PUBLIC_URL is required for billing")
+		}
+		if cfg.BillingPastDueGrace < 0 {
+			return Config{}, errors.New("AO_CLOUD_BILLING_PAST_DUE_GRACE must not be negative")
+		}
+	}
 	if cfg.InterfaceHandoffInterval <= 0 {
 		return Config{}, errors.New("AO_CLOUD_INTERFACE_HANDOFF_INTERVAL must be positive")
 	}
@@ -630,6 +681,19 @@ func Load() (Config, error) {
 		return Config{}, errors.New("repository broker configuration is required in staging")
 	}
 	return cfg, nil
+}
+
+// BillingEnabled reports whether Stripe billing is configured and enforced.
+func (c Config) BillingEnabled() bool {
+	return c.StripeSecretKey != ""
+}
+
+// BillingReturn is the URL Checkout and the Customer Portal return to.
+func (c Config) BillingReturn() string {
+	if c.BillingReturnURL != "" {
+		return c.BillingReturnURL
+	}
+	return c.PublicURL + "/billing/return"
 }
 
 func (c Config) Hosted() bool {

@@ -543,7 +543,14 @@ func (s *Store) PauseIfIdle(
 						-- measuring from created_at pauses these abandoned
 						-- sandboxes too, instead of leaving them running forever
 						-- and billing compute for a session no one is using.
-						AND coalesce(ao_sessions.last_user_message_at, ao_sessions.created_at) <= now() - $3::interval
+						-- Quiet time runs from the latest chat message or
+						-- direct interaction (terminal input, a visible desktop
+						-- view), so typing in a terminal counts as much as a
+						-- chat message does.
+						AND greatest(
+							coalesce(ao_sessions.last_user_message_at, ao_sessions.created_at),
+							coalesce(ao_sandboxes.last_interaction_at, ao_sessions.created_at)
+						) <= now() - $3::interval
 						AND ao_sessions.activity_state <> 'active'
 				)
 				AND NOT EXISTS (
@@ -575,6 +582,26 @@ func (s *Store) PauseIfIdle(
 		return false, err
 	}
 	return paused, nil
+}
+
+// TouchSessionPresence records that a person is looking at a running session
+// (its view is visible in the desktop app): it holds the short interaction
+// lease and counts as an interaction for idle pause. It never wakes a paused
+// session; opening the terminal does that.
+func (s *Store) TouchSessionPresence(
+	ctx context.Context,
+	principal domain.Principal,
+	orgID, sessionID string,
+) error {
+	return s.withSessionAccess(ctx, principal, orgID, sessionID, func(tx pgx.Tx, _ sessionAccess) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE ao_sandboxes SET
+				interactive_until = greatest(coalesce(interactive_until, now()), now() + $3::interval),
+				last_interaction_at = now()
+			WHERE org_id = $1 AND session_id = $2 AND desired_state = 'running'`,
+			orgID, sessionID, intervalString(interactiveSessionLease))
+		return err
+	})
 }
 
 // CountActiveSandboxes counts sandboxes whose provider deletion has not yet

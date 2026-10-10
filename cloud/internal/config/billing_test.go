@@ -1,0 +1,47 @@
+package config
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestBillingIsOffWithoutAStripeKey(t *testing.T) {
+	setWorkOSTestEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BillingEnabled() {
+		t.Fatal("billing enabled without AO_CLOUD_STRIPE_SECRET_KEY")
+	}
+	if cfg.IdlePauseThreshold != 15*time.Minute {
+		t.Fatalf("idle pause default = %v, want 15m", cfg.IdlePauseThreshold)
+	}
+}
+
+func TestBillingRequiresWebhookSecretAndPrices(t *testing.T) {
+	setWorkOSTestEnv(t)
+	t.Setenv("AO_CLOUD_PUBLIC_URL", "https://cp.example.test")
+	t.Setenv("AO_CLOUD_STRIPE_SECRET_KEY", "rk_test_123")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "AO_CLOUD_STRIPE_WEBHOOK_SECRET") {
+		t.Fatalf("missing webhook secret: err = %v", err)
+	}
+	t.Setenv("AO_CLOUD_STRIPE_WEBHOOK_SECRET", "whsec_123")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "AO_CLOUD_STRIPE_PRICE_IDS") {
+		t.Fatalf("missing prices: err = %v", err)
+	}
+	t.Setenv("AO_CLOUD_STRIPE_PRICE_IDS", `{"starter":"prod_123"}`)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "price_") {
+		t.Fatalf("a product id instead of a price id: err = %v", err)
+	}
+	t.Setenv("AO_CLOUD_STRIPE_PRICE_IDS", `{"starter":"price_1","pro":"price_2"}`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.BillingEnabled() || cfg.BillingReturn() != "https://cp.example.test/billing/return" ||
+		cfg.BillingPastDueGrace != 7*24*time.Hour || len(cfg.StripePriceIDs) != 2 {
+		t.Fatalf("billing config = %+v", cfg)
+	}
+}

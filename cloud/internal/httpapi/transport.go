@@ -59,6 +59,9 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, messag
 }
 
 func (s *Server) writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
+	if writePlanError(w, r, err) {
+		return
+	}
 	switch {
 	case errors.Is(err, postgres.ErrForbidden):
 		writeError(w, r, http.StatusForbidden, "forbidden", "You do not have access to this organization.")

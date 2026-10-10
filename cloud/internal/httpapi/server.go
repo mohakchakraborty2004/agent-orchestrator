@@ -207,6 +207,8 @@ type Server struct {
 	notificationWake        func()
 	sandboxWake             func()
 	projectSnapshots        ProjectSnapshotter
+	billingOptions          *BillingOptions
+	billingStore            billingStore
 	notificationWaiters     *notificationWaiters
 	// workerBinariesBySHA serves the content-addressed worker/helper binaries
 	// so a worker with a stale baked copy can heal itself to this exact build.
@@ -257,6 +259,8 @@ type Options struct {
 	// ProjectSnapshots prepares per-project Freestyle snapshots; nil disables
 	// them and every session boots from its harness snapshot.
 	ProjectSnapshots ProjectSnapshotter
+	// Billing configures Stripe billing; nil leaves it off.
+	Billing *BillingOptions
 }
 
 // ProjectSnapshotter looks up and builds a project's prepared snapshot.
@@ -349,6 +353,7 @@ func New(options Options) *Server {
 		notificationWake:          options.NotificationWake,
 		sandboxWake:               options.SandboxWake,
 		projectSnapshots:          options.ProjectSnapshots,
+		billingOptions:            options.Billing,
 		notificationWaiters:       newNotificationWaiters(),
 	}
 	workerBinaries := [][]byte{options.WorkerBinary, options.WorkerHelperBinary}
@@ -356,6 +361,9 @@ func New(options Options) *Server {
 		workerBinaries = append(workerBinaries, build.Binary, build.HelperBinary)
 	}
 	server.workerBinariesBySHA = indexWorkerBinaries(workerBinaries...)
+	if store, ok := options.Store.(billingStore); ok {
+		server.billingStore = store
+	}
 	if server.credentialValidator == nil {
 		server.credentialValidator = newAgentCredentialValidator(nil)
 	}
@@ -402,6 +410,9 @@ func New(options Options) *Server {
 	if server.environmentControlToken != "" {
 		router.Post("/api/cloud/v1/control/github/scratch-projects", server.createEnvironmentScratchProject)
 	}
+	// Stripe signs its webhooks; the handler verifies the signature.
+	router.Post("/api/cloud/v1/billing/stripe/webhook", server.stripeWebhook)
+	router.Get("/billing/return", server.billingReturn)
 	router.Route("/api/cloud/v1", func(router chi.Router) {
 		router.Post("/remote-hosts/{hostId}/address", server.updateRemoteHostAddress)
 		router.Post("/auth/local/register", server.registerLocal)
@@ -494,6 +505,10 @@ func New(options Options) *Server {
 				router.Post("/projects/scratch", server.createGitHubScratchProject)
 			}
 			router.Get("/projects", server.listProjects)
+			router.Get("/billing", server.getBilling)
+			router.Post("/billing/checkout", server.createBillingCheckout)
+			router.Post("/billing/portal", server.createBillingPortal)
+			router.Post("/billing/usage/reset", server.resetBillingUsage)
 			router.Get("/notifications", server.listNotifications)
 			router.Get("/notification-events", server.notificationEvents)
 			router.Patch("/notifications/{notificationId}", server.markNotificationRead)
@@ -527,6 +542,7 @@ func New(options Options) *Server {
 			router.Patch("/sessions/{sessionId}/merge-policy", server.setCloudSessionMergePolicy)
 			router.Post("/sessions/wake", server.wakePausedSessions)
 			router.Post("/sessions/{sessionId}/resume", server.resumeSession)
+			router.Post("/sessions/{sessionId}/presence", server.touchSessionPresence)
 			router.Post("/sessions/{sessionId}/startup-retry", server.retrySessionStartup)
 			router.Post("/sessions/{sessionId}/restore", server.restoreSession)
 			router.Get("/sessions/{sessionId}/children", server.listSessionChildren)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/pkg/contract"
 	"github.com/aoagents/agent-orchestrator/cloud/internal/domain"
@@ -330,7 +331,7 @@ func (s *Store) CreateSession(
 	err := s.withTenant(ctx, principal, orgID, func(tx pgx.Tx) error {
 		var err error
 		session, err = createSessionTx(
-			ctx, tx, orgID, idempotencyKey, maxActiveSandboxes, input, input.ParentSessionID, principal.UserID,
+			ctx, tx, orgID, idempotencyKey, maxActiveSandboxes, s.billing, input, input.ParentSessionID, principal.UserID,
 		)
 		return err
 	})
@@ -569,6 +570,7 @@ func (s *Store) CreateGitHubScratchProject(
 			orgID,
 			"github-scratch:"+commandID,
 			maxActiveSandboxes,
+			s.billing,
 			input.Session,
 			"",
 			principal.UserID,
@@ -615,6 +617,7 @@ func createSessionTx(
 	tx pgx.Tx,
 	orgID, idempotencyKey string,
 	maxActiveSandboxes int,
+	billing billingPolicy,
 	input domain.CreateSession,
 	parentSessionID, actorUserID string,
 ) (domain.Session, error) {
@@ -694,6 +697,12 @@ func createSessionTx(
 	}
 	if maxActiveSandboxes < 1 || activeSandboxes >= maxActiveSandboxes {
 		return domain.Session{}, ErrSandboxQuotaExceeded
+	}
+	// The plan's slots and usage limits, checked under the same organization
+	// lock as the quota above, so concurrent creators cannot both take the
+	// last slot. This covers sessions an orchestrator spawns too.
+	if err := billing.planAdmissionTx(ctx, tx, orgID, input.Kind, true, time.Now()); err != nil {
+		return domain.Session{}, err
 	}
 	var projectConfig json.RawMessage
 	if err := tx.QueryRow(ctx, `SELECT config FROM ao_projects WHERE org_id = $1 AND id = $2 AND archived_at IS NULL`,
