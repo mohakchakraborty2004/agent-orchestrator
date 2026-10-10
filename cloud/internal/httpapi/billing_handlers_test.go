@@ -127,7 +127,7 @@ func (f *fakeStripe) CreateCheckoutSession(_ context.Context, input billing.Chec
 	f.checkouts = append(f.checkouts, input)
 	return "https://checkout.stripe.test/cs_1", nil
 }
-func (f *fakeStripe) CreatePortalSession(context.Context, string, string) (string, error) {
+func (f *fakeStripe) CreatePortalSession(context.Context, string, string, string) (string, error) {
 	return "https://billing.stripe.test/p_1", nil
 }
 func (f *fakeStripe) GetPrice(_ context.Context, id string) (billing.Price, error) {

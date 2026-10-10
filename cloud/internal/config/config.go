@@ -135,6 +135,9 @@ type Config struct {
 	// BillingReturnURL is where Checkout and the Customer Portal send the
 	// browser back to. Defaults to the control plane's /billing/return page.
 	BillingReturnURL string
+	// StripePortalConfiguration is the Customer Portal configuration to open
+	// (AO_CLOUD_STRIPE_PORTAL_CONFIGURATION, bpc_...). Optional.
+	StripePortalConfiguration string
 	// BillingPastDueGrace is how long a past_due subscription keeps working
 	// while Stripe retries the card.
 	BillingPastDueGrace time.Duration
@@ -304,6 +307,7 @@ func Load() (Config, error) {
 		StripeBaseURL:             strings.TrimSpace(os.Getenv("AO_CLOUD_STRIPE_BASE_URL")),
 		StripePriceIDs:            stripePriceIDsEnv,
 		BillingReturnURL:          strings.TrimSpace(os.Getenv("AO_CLOUD_BILLING_RETURN_URL")),
+		StripePortalConfiguration: strings.TrimSpace(os.Getenv("AO_CLOUD_STRIPE_PORTAL_CONFIGURATION")),
 		BillingPastDueGrace:       durationEnv("AO_CLOUD_BILLING_PAST_DUE_GRACE", 7*24*time.Hour),
 
 		DockerHost:        envOrDefault("AO_CLOUD_DOCKER_HOST", "unix:///var/run/docker.sock"),

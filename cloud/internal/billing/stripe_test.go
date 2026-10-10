@@ -107,7 +107,7 @@ func TestAPIErrorsSurfaceStripeMessage(t *testing.T) {
 		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"resource_missing","message":"No such price"}}`)
 	}))
 	defer server.Close()
-	_, err := NewClient("rk_test", server.URL).CreatePortalSession(context.Background(), "cus_1", "")
+	_, err := NewClient("rk_test", server.URL).CreatePortalSession(context.Background(), "cus_1", "", "")
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "resource_missing" || apiErr.Status != 400 {
 		t.Fatalf("err = %v", err)

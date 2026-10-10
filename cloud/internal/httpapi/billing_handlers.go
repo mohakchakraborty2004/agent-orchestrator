@@ -21,7 +21,7 @@ import (
 type StripeAPI interface {
 	CreateCustomer(ctx context.Context, orgID, name string) (string, error)
 	CreateCheckoutSession(ctx context.Context, input billing.CheckoutRequest) (string, error)
-	CreatePortalSession(ctx context.Context, customerID, returnURL string) (string, error)
+	CreatePortalSession(ctx context.Context, customerID, returnURL, configuration string) (string, error)
 	GetSubscription(ctx context.Context, subscriptionID string) (billing.Subscription, error)
 	GetPrice(ctx context.Context, priceID string) (billing.Price, error)
 }
@@ -35,6 +35,9 @@ type BillingOptions struct {
 	// PriceIDs maps a plan name to its Stripe price.
 	PriceIDs  map[string]string
 	ReturnURL string
+	// PortalConfiguration is the Customer Portal configuration (bpc_...) to
+	// open; empty uses the account's default.
+	PortalConfiguration string
 }
 
 // billingStore is the store surface billing needs; the Postgres store
@@ -236,7 +239,8 @@ func (s *Server) createBillingPortal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusConflict, "NO_SUBSCRIPTION", "Choose a plan first.")
 		return
 	}
-	link, err := s.billingOptions.Stripe.CreatePortalSession(r.Context(), state.StripeCustomerID, s.billingOptions.ReturnURL)
+	link, err := s.billingOptions.Stripe.CreatePortalSession(
+		r.Context(), state.StripeCustomerID, s.billingOptions.ReturnURL, s.billingOptions.PortalConfiguration)
 	if err != nil {
 		s.writeBillingProviderError(w, r, "create Stripe portal session", err)
 		return

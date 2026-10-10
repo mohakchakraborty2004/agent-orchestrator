@@ -158,9 +158,14 @@ func (c *Client) CreateCheckoutSession(ctx context.Context, input CheckoutReques
 }
 
 // CreatePortalSession returns the URL of the Customer Portal for a customer.
-func (c *Client) CreatePortalSession(ctx context.Context, customerID, returnURL string) (string, error) {
+// configuration selects a portal configuration (bpc_...); empty uses the
+// account's default, which exists only once it is saved in the dashboard.
+func (c *Client) CreatePortalSession(ctx context.Context, customerID, returnURL, configuration string) (string, error) {
 	form := url.Values{}
 	form.Set("customer", customerID)
+	if configuration != "" {
+		form.Set("configuration", configuration)
+	}
 	if returnURL != "" {
 		form.Set("return_url", returnURL)
 	}

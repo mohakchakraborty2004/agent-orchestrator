@@ -519,10 +519,11 @@ func run(logger *slog.Logger) error {
 	if cfg.BillingEnabled() {
 		store.EnableBilling(cfg.BillingPastDueGrace)
 		apiOptions.Billing = &httpapi.BillingOptions{
-			Stripe:        billing.NewClient(cfg.StripeSecretKey, cfg.StripeBaseURL),
-			WebhookSecret: cfg.StripeWebhookSecret,
-			PriceIDs:      cfg.StripePriceIDs,
-			ReturnURL:     cfg.BillingReturn(),
+			Stripe:              billing.NewClient(cfg.StripeSecretKey, cfg.StripeBaseURL),
+			WebhookSecret:       cfg.StripeWebhookSecret,
+			PriceIDs:            cfg.StripePriceIDs,
+			ReturnURL:           cfg.BillingReturn(),
+			PortalConfiguration: cfg.StripePortalConfiguration,
 		}
 		go (&billing.Enforcer{Store: store, Logger: logger}).Run(ctx)
 		logger.Info("Stripe billing enabled", "plans", len(cfg.StripePriceIDs))
