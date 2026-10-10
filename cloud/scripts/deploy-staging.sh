@@ -19,6 +19,9 @@ NODEOPS_SECRET_ID="${AO_CLOUD_NODEOPS_SECRET_ID:-ao-cloud/staging/nodeops}"
 CODER_SECRET_ID="${AO_CLOUD_CODER_SECRET_ID:-ao-cloud/staging/coder}"
 FREESTYLE_SECRET_ID="${AO_CLOUD_FREESTYLE_SECRET_ID:-ao-cloud/staging/freestyle}"
 WORKER_SECRET_ID="${AO_CLOUD_WORKER_SECRET_ID:-ao-cloud/staging/worker}"
+# Stripe billing is optional: without this secret the control plane runs with
+# billing off, as before.
+STRIPE_SECRET_ID="${AO_CLOUD_STRIPE_SECRET_ID:-ao-cloud/staging/stripe}"
 HEAD_SHA="$(git rev-parse HEAD)"
 RELEASE="${1:-$HEAD_SHA}"
 IMAGE_TAG="${RELEASE//+/-}-linux-amd64"
@@ -156,6 +159,27 @@ if providers_has freestyle; then
 	unset freestyle_settings
 fi
 unset worker_settings
+stripe_secret_arn=""
+if aws_cli secretsmanager describe-secret --secret-id "$STRIPE_SECRET_ID" >/dev/null 2>&1; then
+	stripe_secret_arn="$(secret_arn "$STRIPE_SECRET_ID")"
+	stripe_settings="$(
+		aws_cli secretsmanager get-secret-value \
+			--secret-id "$STRIPE_SECRET_ID" \
+			--query SecretString \
+			--output text
+	)"
+	# Price ids are not credentials; the key and webhook secret stay secrets.
+	stripe_price_ids="$(jq -c '.price_ids // empty' <<<"$stripe_settings")"
+	if [[ -z "$stripe_price_ids" || "$stripe_price_ids" == "{}" ]] ||
+		[[ "$(jq -r '(.secret_key // "") != "" and (.webhook_secret // "") != ""' <<<"$stripe_settings")" != "true" ]]; then
+		echo "$STRIPE_SECRET_ID must hold secret_key, webhook_secret, and price_ids." >&2
+		exit 1
+	fi
+	unset stripe_settings
+	echo "Stripe billing: enabled from $STRIPE_SECRET_ID" >&2
+else
+	echo "Stripe billing: off ($STRIPE_SECRET_ID not found)" >&2
+fi
 
 publish_image() {
 	local repository="$1"
@@ -343,6 +367,13 @@ register_task_definition() {
 				--set-secret "AO_CLOUD_NODEOPS_SSH_KEY_PATH=${nodeops_secret_arn}:ssh_key_path::"
 				--set-secret "AO_CLOUD_NODEOPS_REGION=${nodeops_secret_arn}:region::"
 				--set-secret "AO_CLOUD_NODEOPS_WORKER_TOKEN_TTL=${nodeops_secret_arn}:worker_token_ttl::"
+			)
+		fi
+		if [[ -n "$stripe_secret_arn" ]]; then
+			render_args+=(
+				--set-environment "AO_CLOUD_STRIPE_PRICE_IDS=${stripe_price_ids}"
+				--set-secret "AO_CLOUD_STRIPE_SECRET_KEY=${stripe_secret_arn}:secret_key::"
+				--set-secret "AO_CLOUD_STRIPE_WEBHOOK_SECRET=${stripe_secret_arn}:webhook_secret::"
 			)
 		fi
 		if providers_has freestyle; then
