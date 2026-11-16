@@ -1,12 +1,14 @@
 # AO CLI
 
 The `ao` CLI is a thin Go/Cobra client for the local Agent Orchestrator daemon.
-It starts, discovers, inspects, and stops the daemon through the loopback HTTP
-surface and the `running.json` handshake. It must not open SQLite directly or
+It opens the desktop app (which owns the daemon), and discovers, inspects, and
+stops the daemon through the loopback HTTP surface and the `running.json`
+handshake. It must not open SQLite directly or
 call runtime, workspace, tracker, or agent adapters in-process.
 
 When using the CLI directly from a shell, make sure the daemon is running first
-with `ao start` or by opening the desktop app. Product commands such as
+by opening the desktop app (or `ao start`, which opens it). From a source
+checkout, `go run .` in `backend/` runs the daemon directly. Product commands such as
 `ao agent ls` and `ao spawn` call the loopback daemon and will fail with a
 "daemon is not running" error if no `running.json` points at a live process. From
 a source checkout, build and run the local binary explicitly, for example:
@@ -26,13 +28,15 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 
 | Command                       | Purpose                                                                                                                           |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `ao start`                    | Start the daemon in the background and wait for `/readyz`.                                                                        |
+| `ao start` / `--json`         | Resolve the installed desktop app (downloading the latest release if needed), open it, and exit. The app owns the daemon; `ao start` no longer runs one. |
 | `ao stop`                     | Gracefully stop the daemon via loopback `POST /shutdown` after verifying daemon identity.                                         |
 | `ao status` / `--json`        | Report daemon state from `running.json`, process liveness, `/healthz`, and `/readyz`.                                             |
-| `ao doctor` / `--json`        | Check config, data directory, DB-file presence, daemon state, `git`, and (on Darwin/Linux) `tmux`; on Windows conpty is built in. |
+| `ao doctor` / `--json`        | Check config, data directory, DB-file presence, daemon state, `git`, and (on Darwin/Linux) `tmux`, plus agent-harness, GitHub, and GitLab readiness; on Windows conpty is built in. |
 | `ao completion <shell>`       | Generate completions for `bash`, `zsh`, `fish`, or `powershell`.                                                                  |
 | `ao version` / `ao --version` | Print build metadata.                                                                                                             |
-| `ao daemon`                   | Hidden internal daemon entrypoint used by `ao start`.                                                                             |
+| `ao daemon`                   | Hidden internal daemon entrypoint (the same daemon `go run .` runs from `backend/`); the desktop app launches it.                 |
+| `ao import`                   | Import projects and per-project settings from a legacy `~/.agent-orchestrator` install (`--dry-run`, `--from`, `--yes`, `--json`); the daemon must be stopped. |
+| `ao dev import-projects`      | Developer utility: copy project registry data into the current AO data dir.                                                       |
 
 ### Product commands
 
@@ -64,6 +68,7 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 | `ao send`                           | `POST /api/v1/sessions/{id}/send`              |
 | `ao report ...`                     | `POST /api/v1/reports`                         |
 | `ao preview [url]`                  | `POST /api/v1/sessions/{id}/preview`           |
+| `ao preview clear`                  | Clear the desktop browser panel for the current session. |
 | `ao preview start/status/stop`      | `POST/GET/DELETE /api/v1/sessions/{id}/preview/server` |
 | `ao browser ...`                    | `GET /api/v1/browser/status`, `POST /api/v1/browser/commands` |
 | `ao hooks <agent> <event>`          | `POST /api/v1/sessions/{id}/activity` (hidden) |
@@ -190,7 +195,7 @@ session-owned live Electron browser rather than only setting its preview URL.
 The target-isolated command set includes `status`, `open`, `snapshot`, `click`,
 `dblclick`, `focus`, `fill`, `type`, `press`, `hover`, `scroll`,
 `scrollintoview`, `drag`, `select`, `check`, `uncheck`, `get`, `highlight`,
-`unhighlight`, `tabs`, `tab new`, `tab select`, `tab close`, `frame`, `dialog`,
+`unhighlight`, `act`, `devtools`, `tabs`, `tab new`, `tab select`, `tab close`, `frame`, `dialog`,
 `wait`, `screenshot`, `network start/status/list/stop/clear`, `console`, and
 `errors`. The native engine is bound internally; there is no second command or
 connection setup. Logical tab IDs remain stable for the session, and allowed popups
@@ -248,7 +253,8 @@ export AO_PORT=3037
 
 /tmp/ao status --json
 /tmp/ao doctor
-/tmp/ao start
+/tmp/ao daemon &      # `ao start` would open the desktop app instead
+sleep 2
 /tmp/ao status --json
 /tmp/ao stop
 /tmp/ao status --json
@@ -260,8 +266,7 @@ rm -rf "$tmp"
 Add a product command only when a daemon HTTP route owns the corresponding
 mutation/read; the CLI must call that route rather than reimplementing daemon
 behavior. Commands not yet exposed but with backend routes in place include
-`ao events ...` (over the CDC/SSE endpoint) and CLI parity for PR/review
-actions.
+`ao events ...` (over the CDC/SSE endpoint).
 
 Do not port old in-process TypeScript CLI behavior that mixed command handling
 with storage and runtime implementation details.

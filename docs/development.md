@@ -106,7 +106,7 @@ go build ./...
 ```bash
 cd backend
 # Start the daemon (loopback HTTP server on 127.0.0.1)
-go run .
+go run .      # compatibility wrapper; equivalent to `go run ./cmd/ao daemon`
 ```
 
 The CLI is built with Cobra. From `backend/`, run `go run ./cmd/ao --help` for

@@ -24,6 +24,8 @@ in [gemini-cli.md](gemini-cli.md).
 | [cloud-refactor.md](cloud-refactor.md)                 | Public contracts, generated Cloud schema types, typed client, reusable product UI, and private implementation boundaries. |
 | [development.md](development.md)                       | Prerequisites, build steps, running tests, and troubleshooting for local development.                                 |
 | [harnesses/unreal-agent.md](harnesses/unreal-agent.md) | Built-in Unreal Agent Chat setup, provider environment, persistence, and current limits.                              |
+| [harnesses/omp.md](harnesses/omp.md)                   | OMP Terminal UI and Chat setup, version requirements, activity hooks, and current limits.                            |
+| [harnesses/pi.md](harnesses/pi.md)                     | Pi TUI and Chat (pi-acp) setup, the bypass-permissions fallback, and current limits.                                 |
 | [harnesses/mimo-code.md](harnesses/mimo-code.md)       | MiMo Code TUI setup, permissions, activity hooks, exact restore, and current limits.                                 |
 | [harnesses/deepseek-harness.md](harnesses/deepseek-harness.md) | DeepSeek Harness Chat over ACP, headless task mode, credentials, and current limits.                        |
 | [STATUS.md](STATUS.md)                                 | What is shipped on `main` today and what is still in flight.                                                          |

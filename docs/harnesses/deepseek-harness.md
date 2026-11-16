@@ -10,7 +10,7 @@ Install it with npm from Settings → Agents, or manually:
 npm install -g @deepseek-ai/dsh
 ```
 
-Choose `deepseek-harness` as a project's agent or pass `ao spawn --harness deepseek`.
+Choose `deepseek-harness` as a project's agent or pass `ao spawn --harness deepseek-harness`.
 The harness id is `deepseek-harness`; the binary AO resolves is `dsh`.
 
 ## Chat

@@ -210,7 +210,7 @@ backend/internal/
 ├── httpd/               # HTTP API, controllers, terminal mux
 ├── terminal/            # Terminal session protocol
 ├── adapters/            # Concrete adapter implementations
-│   ├── agent/           # 23+ agent harnesses
+│   ├── agent/           # 33 agent adapters (see registry/registry.go)
 │   ├── chatdriver/      # Native provider protocols and reusable ACP transport
 │   ├── runtime/         # tmux/conpty runtimes
 │   ├── workspace/       # git worktree and standalone-directory adapters
